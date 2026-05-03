@@ -364,7 +364,7 @@ class ServerArgs:
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
     enable_dynamic_chunking: bool = False
-    max_prefill_tokens: int = 16384
+    max_prefill_tokens: Optional[int] = None
     prefill_max_requests: Optional[int] = None
     schedule_policy: str = "fcfs"
     enable_priority_scheduling: bool = False
@@ -1367,19 +1367,39 @@ class ServerArgs:
                         self.cuda_graph_max_bs = 256
                     else:
                         self.cuda_graph_max_bs = 512
+                if self.max_prefill_tokens is None:
+                    # H200-class: bump above the historical 16k floor so the
+                    # scheduler can pack >1 long-prompt chunk per step.
+                    self.max_prefill_tokens = max(16384, 2 * self.chunked_prefill_size)
             else:
-                # B200, MI300
+                # B200, B300, MI300
                 # (chunked_prefill_size 16k, cuda_graph_max_bs 512)
                 if self.chunked_prefill_size is None:
                     self.chunked_prefill_size = 16384
                 if self.cuda_graph_max_bs is None:
                     self.cuda_graph_max_bs = 512
+                if self.max_prefill_tokens is None:
+                    # Big-memory Blackwell-class GPUs (B200 / B300) and MI300:
+                    # the historical 16k default forces 8 simultaneous 16k-token
+                    # requests to serialize through chunked-prefill (only one
+                    # chunk fits per scheduler step), so TTFT scales ~linearly
+                    # in concurrency. With ~275GB HBM we can comfortably size
+                    # max_prefill_tokens to 4x chunked_prefill_size, draining
+                    # the prefill backlog 4x faster without OOMing the
+                    # activation buffer.
+                    self.max_prefill_tokens = max(16384, 4 * self.chunked_prefill_size)
         else:
             # Fallback defaults when gpu_mem is None
             if self.chunked_prefill_size is None:
                 self.chunked_prefill_size = 4096
             if self.cuda_graph_max_bs is None:
                 self.cuda_graph_max_bs = 160
+
+        # Final fallback: keep the historical 16k floor for tiers that did not
+        # explicitly bump max_prefill_tokens above. This preserves behavior on
+        # smaller GPUs where the activation budget is tight.
+        if self.max_prefill_tokens is None:
+            self.max_prefill_tokens = 16384
 
         # Set cuda graph batch sizes
         if self.device != "cpu":
@@ -4532,7 +4552,12 @@ class ServerArgs:
             "--max-prefill-tokens",
             type=human_readable_int,
             default=ServerArgs.max_prefill_tokens,
-            help="The maximum number of tokens in a prefill batch. The real bound will be the maximum of this value and the model's maximum context length."
+            help="The maximum number of tokens in a prefill batch (across all "
+            "concurrent prefill requests). The real bound will be the maximum "
+            "of this value and the model's maximum context length. If unset, "
+            "defaults to 4 * chunked_prefill_size on big-memory Blackwell-class "
+            "GPUs (B200 / B300 / MI300, >=160 GB HBM), 2 * chunked_prefill_size "
+            "on H200-class (>=90 GB HBM), and 16384 elsewhere."
             + f"\n\n{human_readable_int.__doc__}",
         )
         parser.add_argument(
