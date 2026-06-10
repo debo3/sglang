@@ -170,6 +170,7 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
 )
 from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
+from sglang.srt.managers.scheduler_gc_manager import SchedulerGCManager
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
@@ -1192,6 +1193,10 @@ class Scheduler(
         # Configure GC logger
         if envs.SGLANG_LOG_GC.get():
             configure_gc_logger()
+
+        # Keep stop-the-world GC pauses away from the batch critical path
+        # (a gen-2 pause in one TP rank stalls every rank).
+        self.gc_manager = SchedulerGCManager()
 
     def init_disaggregation(self):
         self.disaggregation_mode = DisaggregationMode(

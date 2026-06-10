@@ -576,6 +576,9 @@ class SchedulerRuntimeCheckerMixin:
         # reset device timer window so idle time isn't counted
         self.reset_device_timer_window()
 
+        # reclaim cyclic garbage while a pause cannot stall in-flight batches
+        self.gc_manager.on_idle()
+
         # sleep until next event
         self.maybe_sleep_on_idle()
 
