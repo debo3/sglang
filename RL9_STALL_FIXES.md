@@ -130,7 +130,28 @@ Causality cross-checks worth noting:
   then zero did **not** stop the stalls — only removing the GC pauses did. Hence commit 1+2
   are the fix and commit 3 is a (worthwhile) latency improvement.
 
-## 4. Deployment notes
+## 4. Branch verification on hardware (2026-06-10)
+
+This exact branch code was run end-to-end on the incident hardware (8×B300, rl9 weights, TP=8,
+prod CLI args). Because `main` requires `sgl-kernel >= 0.4.3` (no published image yet), the three
+commits were cherry-picked unmodified onto `v0.5.12.post1` (branch
+`fix/rl9-gc-stall-and-evict-sync-v0512`; the only adaptation is the `on_idle` hook location,
+which lives in `scheduler_runtime_checker_mixin.py` there) and the fork tree was mounted over
+`lmsysorg/sglang:latest` (= v0.5.12.post1, flashinfer 0.6.11.post1 — leak present) via
+`PYTHONPATH`. Load: 6-stream ~15k-token conversation waves + sparse singles + mid-stream aborts +
+4 s `/health_generate` probe. Results over the 2-hour window:
+
+| Check | Evidence |
+|---|---|
+| Fix 1 armed | `Scheduler GC management enabled: gen-2 threshold 10 -> 10000` on all 8 ranks; in-process `gc.get_threshold() == (700, 10, 10000)` |
+| Fix 1 initial freeze | `Initial post-warmup GC freeze: collected 0, froze 954,058 objects (1.069s)` on first idle tick |
+| Fix 1 idle GC | gen-2 collection counter advanced 21 → 28 (collections now happen only at idle); unfrozen heap steady at ~58 k objects |
+| Fix 2 armed | `Applied flashinfer TuningConfig memoization to 1 MoERunner class(es)` on all 8 ranks (lazy factory wrap) |
+| Fix 2 leak dead | five censuses over 2 h under load: `TuningConfig` in flight = **1** throughout; memo bounded at 12 entries (unfixed code: +~46 object-sets/s, 3.2 M configs by 6.5 h) |
+| Fix 3 at full pool | 25,280 evictions: 25,273 ≤ 10 ms, **all** ≤ 50 ms, mean 2.7 ms (unfixed: 94 % of time in the sync, spikes to seconds) |
+| End to end | **0** log-silence gaps ≥ 6 s, **1,458/1,458** health probes OK, zero `Health check failed` — same harness that reproduced the production failure in 3.5 h on unfixed code |
+
+## 5. Deployment notes
 
 - These fixes remove the need for the interim mitigations (periodic `/freeze_gc` CronJob,
   `sitecustomize` patch). Still recommended operationally:
