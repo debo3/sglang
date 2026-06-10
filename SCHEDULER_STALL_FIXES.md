@@ -164,7 +164,26 @@ published image via `PYTHONPATH` (the v0.5.12 backport branch, since `main` requ
 
 ### 4.3 Public checkpoint verification (`deepseek-ai/DeepSeek-V3.1-Terminus`, fp8)
 
-[PENDING — stock-image leak reproduction + fixed-branch verification on the public weights]
+Run on the same 8×B300 node, published `lmsysorg/sglang` image (sglang 0.5.12.post1,
+flashinfer 0.6.11.post1), public weights, default backend resolution
+(`attention_backend=trtllm_mla`, `moe_runner_backend=flashinfer_trtllm`, `page_size=64`),
+identical load harness. Stock image vs. this branch mounted via `PYTHONPATH`:
+
+| Measurement | Stock image | This branch |
+|---|---|---|
+| Live `TuningConfig` objects, minutes after warmup | **9,244** | 1 |
+| Growth over the next ~8–10 min under load | **9,244 → 46,289 (~74/s)** | 1 → 1 (memo bounded at 12–13 entries) |
+| Tracked (unfrozen) heap objects | 1.19 M → 2.09 M and climbing | 15 k → 47 k (working set only) |
+| GC state | stock thresholds, nothing frozen, gen-2 churning over a growing heap | thresholds (700, 10, 10000); 954 k-object startup heap frozen in 0.4 s |
+| Health probes (fixed-branch soak, ~47 min) | — | **554/554 OK**, 0 log-silence gaps ≥ 6 s |
+| Eviction at full pool (fixed branch, `--max-total-tokens 262144` to fill the pool quickly) | — | **1,568 evictions, all ≤ 10 ms, mean 0.38 ms** |
+
+Notes: the fp8 public checkpoint leaks via the fp8 block-scale MoE entry points (same per-call
+`TuningConfig` pattern as the bf16 path) and ~60 % faster than the bf16 measurement above —
+on this trajectory a stock server reaches the multi-ten-second gen-2 pause regime in well
+under a day. The fp8 KV cache also doubles `max_total_num_tokens` (2.23 M on this hardware),
+so reaching the full-pool eviction regime takes proportionally longer; `--max-total-tokens`
+shrinks the pool to reproduce that regime quickly.
 
 ## 5. Deployment notes
 
