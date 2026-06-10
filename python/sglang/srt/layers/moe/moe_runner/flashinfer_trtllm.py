@@ -33,6 +33,16 @@ from sglang.srt.utils.common import (
     is_flashinfer_available,
     next_power_of_2,
 )
+from sglang.srt.utils.patch_flashinfer import (
+    monkey_patch_flashinfer_tuning_config_memo,
+)
+
+# Workaround for the flashinfer fused-MoE TuningConfig leak (flashinfer#2139):
+# without it, every MoE call permanently leaks a TuningConfig (+closures) into
+# the autotuner's unbounded lru_cache, growing gen-2 GC pauses with uptime
+# until one TP rank's pause stalls the whole TP group past the health-check
+# window. Lazy: takes effect on first MoE module build.
+monkey_patch_flashinfer_tuning_config_memo()
 
 logger = __import__("logging").getLogger(__name__)
 

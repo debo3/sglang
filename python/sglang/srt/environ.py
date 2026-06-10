@@ -373,6 +373,9 @@ class Envs:
 
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
+    # Opt-out for the flashinfer fused-MoE TuningConfig leak workaround
+    # (see utils/patch_flashinfer.py, flashinfer#2139).
+    SGLANG_DISABLE_FLASHINFER_TUNING_CONFIG_MEMO = EnvBool(False)
     SGLANG_FLASHINFER_USE_PAGED = EnvBool(False)
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
