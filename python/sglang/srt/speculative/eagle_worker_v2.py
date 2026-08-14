@@ -1111,6 +1111,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch, capture_hidden_mode=target_capture_mode
             )
 
+            # The sampled target token is final at this point.  Draft prefill
+            # below prepares only future speculative iterations and must not be
+            # on the first-token result-copy dependency chain.  Record the
+            # precise CUDA boundary so the scheduler can copy/stream the target
+            # result while draft initialization continues on this stream.
+            batch_output.output_ready = torch.get_device_module(self.device).Event()
+            batch_output.output_ready.record()
+
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
             # Extend processed L prompt tokens; next verify iter expects same L.
             batch_output.new_seq_lens = batch.seq_lens

@@ -67,6 +67,12 @@ class GenerationBatchResult:
 
     # For overlap scheduling
     copy_done: Optional[torch.cuda.Event] = None
+    # Earliest point at which client-visible result tensors are complete.  MTP
+    # prefill records this after the target token is sampled but before draft
+    # initialization.  The result-copy stream may wait on this event instead of
+    # the tail of the forward stream, allowing the exact target token to reach
+    # the client while draft initialization continues on the compute stream.
+    output_ready: Optional[torch.cuda.Event] = None
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None

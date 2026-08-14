@@ -1773,10 +1773,18 @@ class Scheduler(
                 batch, last_batch=self.last_batch
             )
 
+            # Usually there is exactly one pending result: the batch launched
+            # in the previous iteration.  Remember that fact before appending
+            # the current result.  A speculative prefill may have published
+            # its exact target token eagerly, leaving no previous result in the
+            # queue even though `last_batch` is non-null.
+            had_pending_previous_result = bool(self.result_queue)
+
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
-            if disable_overlap_for_batch:
+            if disable_overlap_for_batch and had_pending_previous_result:
                 pop_and_process()
+                had_pending_previous_result = False
                 # Opportunistic flush at the disable_overlap sync boundary:
                 # forward_stream is idle (prev forward drained, next not launched),
                 # so `_flush`'s non-urgent guard compacts freely. Sync-free, best-effort.
@@ -1798,11 +1806,28 @@ class Scheduler(
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if not disable_overlap_for_batch and had_pending_previous_result:
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
+
+            # Spec-v2 target prefill has already sampled the exact first token,
+            # and run_batch queued its D2H copy behind `output_ready` rather
+            # than behind draft initialization.  Publish this result now,
+            # before the next verify launch.  The normal overlap loop otherwise
+            # launches that dependent verify first and does not expose the
+            # earlier CUDA boundary to the client.
+            process_current_prefill_early = (
+                batch is not None
+                and batch.forward_mode.is_extend()
+                and not batch.spec_algorithm.is_none()
+                and batch_result is not None
+                and batch_result.output_ready is not None
+                and batch.contains_last_prefill_chunk
+            )
+            if process_current_prefill_early:
+                pop_and_process()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -3723,7 +3748,16 @@ class Scheduler(
                                 # Result D2H on copy_stream overlaps the next forward
                                 # instead of serializing on forward_stream; it's a leaf
                                 # gated by copy_done, so nothing on forward_stream waits.
-                                self.copy_stream.wait_stream(self.forward_stream)
+                                if batch_result.output_ready is not None:
+                                    # Speculative prefill has already sampled an
+                                    # exact target token.  Copy it at target-end
+                                    # rather than waiting for draft initialization,
+                                    # which is needed only by subsequent steps.
+                                    self.copy_stream.wait_event(
+                                        batch_result.output_ready
+                                    )
+                                else:
+                                    self.copy_stream.wait_stream(self.forward_stream)
                                 with self.copy_stream_ctx:
                                     batch_result.copy_to_cpu(
                                         return_logprob=batch.return_logprob,
