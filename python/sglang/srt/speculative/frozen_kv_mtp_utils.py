@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 def frozen_kv_target_view(
     forward_batch: ForwardBatch,
     kv_context: FrozenKVMTPContext,
-    draft_attn_backend: "AttentionBackend",
+    draft_attn_backend: AttentionBackend,
 ):
     """Build attention metadata against committed target-prefix geometry.
 
@@ -61,7 +61,7 @@ def frozen_kv_target_view(
 def target_kv_pool_view(
     forward_batch: ForwardBatch,
     kv_context: FrozenKVMTPContext,
-    draft_attn_backend: "AttentionBackend",
+    draft_attn_backend: AttentionBackend,
 ):
     """Run the draft model's forward with the target's frozen KV pool.
 
@@ -129,9 +129,11 @@ def expand_for_topk_draft(forward_batch: ForwardBatch, topk: int) -> None:
 
     positions = torch.clamp(forward_batch.seq_lens - 1, min=0).to(torch.int64)
     forward_batch.positions = positions
-    forward_batch.num_token_non_padded_cpu = positions.numel()
-    if forward_batch.num_token_non_padded is not None:
-        forward_batch.num_token_non_padded.fill_(positions.numel())
+    forward_batch.global_num_token_non_padded_cpu = positions.numel()
+    # Bump the GLOBAL scalar; the LOCAL count is derived from it when the draft
+    # forward localizes (eager prep / graph replay).
+    if forward_batch.global_num_token_non_padded is not None:
+        forward_batch.global_num_token_non_padded.fill_(positions.numel())
     if (
         forward_batch.mrope_positions is not None
         and forward_batch.mrope_positions.shape[-1] * topk == positions.numel()

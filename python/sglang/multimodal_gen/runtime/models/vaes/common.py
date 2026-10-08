@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from abc import ABC, abstractmethod
+from functools import lru_cache
 from math import isqrt, prod
 from typing import Optional, cast
 
@@ -14,17 +15,76 @@ from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 
 from sglang.multimodal_gen.configs.models import VAEConfig
+from sglang.multimodal_gen.configs.models.vaes.base import (
+    should_use_spatial_shard_parallel_decode,
+)
+from sglang.multimodal_gen.runtime.cache.conditioning import (
+    cached_vae_encode,
+    register_conditioning_container,
+)
 from sglang.multimodal_gen.runtime.distributed import (
+    get_decode_parallel_group_coordinator,
+    get_decode_parallel_world_size,
+    get_sp_group,
     get_sp_parallel_rank,
     get_sp_world_size,
+    model_parallel_is_initialized,
 )
+from sglang.multimodal_gen.runtime.distributed.utils import all_gather_single
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
 
 
+@lru_cache(maxsize=1)
+def _cached_decode_parallel_world_size(
+    is_dist_initialized: bool, is_model_parallel_initialized: bool, group_id: int
+) -> int:
+    if not is_dist_initialized or not is_model_parallel_initialized:
+        return 1
+    return get_decode_parallel_world_size()
+
+
+def _decode_parallel_world_size() -> int:
+    is_dist_initialized = dist.is_initialized()
+    is_model_parallel_initialized = model_parallel_is_initialized()
+    if not is_dist_initialized or not is_model_parallel_initialized:
+        return _cached_decode_parallel_world_size(
+            is_dist_initialized, is_model_parallel_initialized, 0
+        )
+    return _cached_decode_parallel_world_size(
+        is_dist_initialized,
+        is_model_parallel_initialized,
+        id(get_decode_parallel_group_coordinator()),
+    )
+
+
+def has_decode_parallel_world() -> bool:
+    return _decode_parallel_world_size() > 1
+
+
+def can_install_spatial_shard_parallel_decode(config: VAEConfig | None) -> bool:
+    world_size = _decode_parallel_world_size()
+    return (
+        config is not None
+        and world_size > 1
+        and should_use_spatial_shard_parallel_decode(config, world_size=world_size)
+    )
+
+
+def should_run_spatial_shard_parallel_decode(
+    config: VAEConfig, z: torch.Tensor
+) -> bool:
+    world_size = _decode_parallel_world_size()
+    return world_size > 1 and should_use_spatial_shard_parallel_decode(
+        config, z, world_size
+    )
+
+
 class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
     layerwise_offload_dit_group_enabled = False
+    # decode(z, on_frames=...) hands out finished frames while it decodes
+    supports_decode_on_frames = False
     layer_names = [
         "encoder.down_blocks",
         "decoder.up_blocks",
@@ -84,6 +144,7 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
     def _decode(self, *args, **kwargs) -> torch.Tensor:
         pass
 
+    @cached_vae_encode
     def encode(self, x: torch.Tensor) -> DiagonalGaussianDistribution:
         batch_size, num_channels, num_frames, height, width = x.shape
         latent_num_frames = (num_frames - 1) // self.temporal_compression_ratio + 1
@@ -115,7 +176,15 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
         )
         num_sample_frames = (num_frames - 1) * self.temporal_compression_ratio + 1
 
-        if self.use_tiling and self.use_parallel_tiling and get_sp_world_size() > 1:
+        if should_run_spatial_shard_parallel_decode(self.config, z):
+            return self._decode(z)[:, :, :num_sample_frames]
+
+        if (
+            self.parallel_decode_mode == "tiled"
+            and self.use_tiling
+            and self.use_parallel_tiling
+            and get_sp_world_size() > 1
+        ):
             return self.parallel_tiled_decode(z)[:, :, :num_sample_frames]
         if (
             self.use_tiling
@@ -220,7 +289,8 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
         """
         Parallel version of tiled_decode that distributes both temporal and spatial computation across GPUs
         """
-        world_size, rank = get_sp_world_size(), get_sp_parallel_rank()
+        sp_group = get_sp_group()
+        world_size, rank = sp_group.world_size, sp_group.rank_in_group
         _, _, T, H, W = z.shape
 
         tile_latent_min_height = (
@@ -295,7 +365,7 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
             torch.zeros(1, device=results.device, dtype=torch.int64)
             for _ in range(world_size)
         ]
-        dist.all_gather(all_sizes, local_size)
+        dist.all_gather(all_sizes, local_size, group=sp_group.device_group)
         max_size = max(size.item() for size in all_sizes)
 
         padded_results = torch.zeros(
@@ -309,8 +379,12 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
             .repeat(world_size, *[1] * len(padded_results.shape))
             .contiguous()
         )
-        dist.all_gather_into_tensor(gathered_results, padded_results)
-        dist.all_gather_object(gathered_dim_metadata, local_dim_metadata)
+        all_gather_single(
+            gathered_results.view(-1), padded_results, group=sp_group.device_group
+        )
+        dist.all_gather_object(
+            gathered_dim_metadata, local_dim_metadata, group=sp_group.cpu_group
+        )
         gathered_dim_metadata = cast(list[list[torch.Size]], gathered_dim_metadata)
 
         data: list = [
@@ -450,7 +524,7 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
             device=padded_results.device,
             dtype=padded_results.dtype,
         )
-        dist.all_gather_into_tensor(gathered_results, padded_results)
+        all_gather_single(gathered_results, padded_results)
 
         dec = z.new_empty(
             (
@@ -687,8 +761,8 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
 
 
 # adapted from https://github.com/huggingface/diffusers/blob/e7ffeae0a191f710881d1fbde00cd6ff025e81f2/src/diffusers/models/autoencoders/vae.py#L691
+@register_conditioning_container
 class DiagonalGaussianDistribution:
-
     def __init__(self, parameters: torch.Tensor, deterministic: bool = False):
         self.parameters = parameters
         self.mean, self.logvar = torch.chunk(parameters, 2, dim=1)

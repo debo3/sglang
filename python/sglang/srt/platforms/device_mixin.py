@@ -27,10 +27,15 @@ Method status annotations:
 
 import enum
 import random
+from collections.abc import Iterator
+from contextlib import contextmanager
+from functools import cached_property
 from typing import NamedTuple, Optional
 
 import numpy as np
 import torch
+
+from sglang.srt.environ import envs
 
 
 class PlatformEnum(enum.Enum):
@@ -77,6 +82,16 @@ class DeviceCapability(NamedTuple):
         """Express capability as ``<major><minor>`` (minor is single digit)."""
         assert 0 <= self.minor < 10
         return self.major * 10 + self.minor
+
+
+_DEVICE_TO_DISTRIBUTED_BACKEND: dict[str, str] = {
+    "cuda": "nccl",
+    "xpu": "xccl",
+    "hpu": "hccl",
+    "cpu": "gloo",
+    "npu": "hccl" if not envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0 else "zbal",
+    "musa": "mccl",
+}
 
 
 class DeviceMixin:
@@ -147,6 +162,15 @@ class DeviceMixin:
         """[Active] Get current peak memory usage in bytes."""
         raise NotImplementedError
 
+    def is_pin_memory_available(self, device=None) -> bool:
+        """[Active] Whether pinned host memory is available for a target device."""
+        return False
+
+    @contextmanager
+    def reindex_device_id(self, device_id: int) -> Iterator[int]:
+        """[Active] Temporarily remap a physical device to logical device 0."""
+        yield device_id
+
     # ------------------------------------------------------------------
     # Planned methods — reserved interface.  Core still uses hardcoded
     # calls (e.g. torch.cuda.*).  OOT implementations will NOT take
@@ -192,8 +216,13 @@ class DeviceMixin:
     # ---- Distributed ----
 
     def get_torch_distributed_backend_str(self) -> str:
-        """[Planned] Return the torch.distributed backend string (e.g. "nccl", "hccl")."""
-        raise NotImplementedError
+        """Return the torch.distributed backend string (e.g. "nccl", "hccl").
+
+        Default: lookup ``self.device_type`` in ``_DEVICE_TO_DISTRIBUTED_BACKEND``,
+        falling back to ``"gloo"``. Subclasses override only when they need a
+        non-default backend (e.g. mooncake, or a brand-new device).
+        """
+        return _DEVICE_TO_DISTRIBUTED_BACKEND.get(self.device_type, "gloo")
 
     def get_communicator_class(self) -> type | None:
         """[Planned] Return platform-specific communicator class, or None for default."""
@@ -218,6 +247,10 @@ class DeviceMixin:
         """[Planned] Validate that a quantization method is supported. No-op by default."""
         pass
 
+    @cached_property
+    def cpu_arch(self) -> "CpuArchEnum":
+        return self.get_cpu_architecture()
+
     @classmethod
     def get_cpu_architecture(cls) -> "CpuArchEnum":
         """[Planned] Detect CPU architecture."""
@@ -229,6 +262,14 @@ class DeviceMixin:
         elif machine in ("arm64", "aarch64"):
             return CpuArchEnum.ARM
         return CpuArchEnum.UNSPECIFIED
+
+    def get_torch_profiler_activity_str(self) -> str:
+        """[Planned] Return the torch profiler activity string."""
+        raise NotImplementedError
+
+    def get_torch_profiler_activity(self) -> torch.profiler.ProfilerActivity:
+        """[Planned] Return the torch profiler activity."""
+        raise NotImplementedError
 
     # ------------------------------------------------------------------
     # Dunder helpers
